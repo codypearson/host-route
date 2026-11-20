@@ -1,0 +1,3 @@
+# Optional local sing-box binary. The installed copy comes from the package.
+bin/
+*.tar.gz
