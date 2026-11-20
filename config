@@ -1,0 +1,3 @@
+# NetworkManager connection that owns the tunnel interface.
+# Set this to the profile name, then start the route.
+connection=

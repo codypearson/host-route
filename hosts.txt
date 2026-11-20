@@ -1,0 +1,9 @@
+# Seed host list. install.sh copies this to /etc/host-route/hosts.txt
+# when that file does not already exist. Edit the copy in /etc.
+#
+# One name per line. Blank lines and '#' comments are ignored.
+# A leading "*." matches that name and every subdomain.
+# Every other destination keeps the kernel's current default route.
+
+# example.com
+# *.example.org

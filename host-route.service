@@ -1,0 +1,18 @@
+[Unit]
+Description=Hostname split route
+Documentation=file:///usr/local/share/host-route/README.md
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/host-route run
+TimeoutStartSec=30
+TimeoutStopSec=15
+# A failed start rolls its own rules back. Restarting would put them back
+# without an operator looking at the failure.
+Restart=no
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

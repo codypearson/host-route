@@ -1,0 +1,855 @@
+#!/usr/bin/env bash
+# Steer an explicit hostname list out one existing VPN, and leave every
+# other destination on the kernel route that is already the default.
+#
+# The VPN profile is expected to be a split tunnel: it installs its own
+# prefixes and does not replace the default route. A hostname that resolves
+# to a shared address (for example a CDN) therefore leaves from the normal
+# default path. Routing that address would also capture every other site on
+# it.
+#
+# This process owns a separate TUN (hostroute). Applications are delivered
+# there, sing-box reads the TLS or QUIC server name, and:
+#   - a listed name is dialed with fwmark 76, which policy-routes out the
+#     VPN interface (table 76);
+#   - every other name is dialed with fwmark 77, which is looked up in the
+#     main table. That is the live default route, and it keeps those sockets
+#     out of hostroute. A goto to a priority with no rule does not do this:
+#     the kernel leaves the goto unresolved and the socket is captured again.
+# LAN routes and the VPN's own prefixes are more specific than a default
+# route, so the kernel still applies them directly and they never enter
+# hostroute.
+#
+# Matching needs a visible server name (TLS SNI or QUIC). A connection with
+# no server name, or an encrypted ClientHello, stays on the default path.
+# Ping is not matched. Edit the host list, then run "reload".
+#
+# The sing-box package ships sing-box.service. That unit runs as the
+# sing-box user, loads every file in /etc/sing-box, and is meant to start at
+# boot. This route is generated from a live VPN interface and also owns
+# policy rules and a firewalld zone, so host-route.service supervises it
+# instead. The packaged unit stays disabled.
+#
+# Reserved while running: ip rules 50-53 (DNS), 100 and 101, rules 9000-9010,
+# tables 76 and 2022, and the hostroute interface. sing-box installs
+# 9000-9010. While firewalld is running, hostroute is moved to the trusted
+# zone so the handshake it writes back to this host is not rejected.
+#
+# Installed paths (see install.sh):
+#   /usr/local/bin/host-route
+#   /etc/host-route/hosts.txt
+#   /etc/host-route/config
+#   /etc/systemd/system/host-route.service
+# sudo on some systems does not search /usr/local/bin, so install.sh also
+# links the command from /usr/bin when secure_path requires it.
+#
+# Environment:
+#   HOST_ROUTE_CONNECTION   NetworkManager profile (overrides config)
+#   HOST_ROUTE_LOG          sing-box log level (default warn)
+#   HOST_ROUTE_BIN          sing-box binary (default: the one on PATH)
+#   HOST_ROUTE_HOSTS        host list (default: /etc/host-route/hosts.txt)
+#   HOST_ROUTE_SKIP_CHECK   set to skip the DNS and HTTPS self-check
+
+set -euo pipefail
+
+LOG_LEVEL="${HOST_ROUTE_LOG:-warn}"
+VPN_CONNECTION=""
+
+# fwmark 76 selects the VPN. fwmark 77 resumes normal policy.
+TUNNEL_MARK=76
+DIRECT_MARK=77
+TUNNEL_TABLE=76
+TUNNEL_RULE_PREF=100
+DIRECT_RULE_PREF=101
+# System DNS stays on the main table. Capturing it makes the stub resolver
+# time out, which is the browser error "DNS address could not be found".
+DNS_UDP_PREF=50
+DNS_TCP_PREF=51
+DOT_TCP_PREF=52
+DOT_UDP_PREF=53
+
+# sing-box auto_route owns this range.
+SINGBOX_TABLE=2022
+SINGBOX_RULE_INDEX=9000
+SINGBOX_RULE_END=9010
+
+TUN_NAME="hostroute"
+TUN_ADDRESS="172.19.0.1/30"
+STATE_DIR="/run/host-route"
+DISPATCHER_PATH="/etc/NetworkManager/dispatcher.d/90-host-route"
+SERVICE_NAME="host-route.service"
+UNIT_PATH="/etc/systemd/system/host-route.service"
+
+SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
+SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
+ETC_DIR="/etc/host-route"
+ETC_HOSTS="${ETC_DIR}/hosts.txt"
+ETC_CONFIG="${ETC_DIR}/config"
+SHARE_HOSTS="/usr/local/share/host-route/hosts.txt"
+SING_BOX=""
+
+CONFIG_FILE="$STATE_DIR/config.json"
+PID_FILE="$STATE_DIR/sing-box.pid"
+LOG_FILE="$STATE_DIR/sing-box.log"
+LOCK_FILE="$STATE_DIR/lock"
+SUMMARY_FILE="$STATE_DIR/summary"
+
+usage() {
+    cat <<EOF
+Usage: host-route <command>
+
+  start                 Route the host list through the configured VPN
+  stop                  Remove the TUN and the policy rules
+  reload                Apply hosts.txt. Starts the route if it is down
+  status                Show the tunnel, the host list, and the default route
+  check                 Parse hosts.txt and validate the generated config
+  run                   Foreground mode used by ${SERVICE_NAME}
+  install-dispatcher    Start and stop with the VPN
+  uninstall-dispatcher  Remove the NetworkManager dispatcher
+
+The host list is ${ETC_HOSTS}. The VPN profile name is the connection=
+line in ${ETC_CONFIG}. start, stop, reload, run, and the dispatcher
+commands need root.
+EOF
+}
+
+die() {
+    echo "host-route: $*" >&2
+    exit 1
+}
+
+# connection= in the config file. HOST_ROUTE_CONNECTION wins when it is set.
+# Prints the profile name, or returns non-zero when nothing is configured.
+read_connection() {
+    local file value
+    if [[ -n "${HOST_ROUTE_CONNECTION:-}" ]]; then
+        printf '%s' "$HOST_ROUTE_CONNECTION"
+        return 0
+    fi
+    for file in "$ETC_CONFIG" "$SCRIPT_DIR/config"; do
+        [[ -f "$file" ]] || continue
+        value=$(awk -F= '
+            /^[[:space:]]*#/ { next }
+            /^[[:space:]]*$/ { next }
+            $1 ~ /^[[:space:]]*connection[[:space:]]*$/ {
+                sub(/^[^=]*=/, "")
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+                if ($0 != "") {
+                    print
+                    exit
+                }
+            }
+        ' "$file")
+        if [[ -n "$value" ]]; then
+            printf '%s' "$value"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Commands that open the VPN need a profile name. stop and status do not.
+ensure_connection() {
+    if [[ -n "$VPN_CONNECTION" ]]; then
+        return 0
+    fi
+    VPN_CONNECTION=$(read_connection) || die "set connection= in ${ETC_CONFIG} to the NetworkManager profile that owns the tunnel"
+}
+
+# Prefer an explicit override, then the system list, then the copy beside
+# this script. The last case is a git checkout that has not been installed.
+hosts_file() {
+    if [[ -n "${HOST_ROUTE_HOSTS:-}" ]]; then
+        printf '%s' "$HOST_ROUTE_HOSTS"
+        return
+    fi
+    if [[ -f "$ETC_HOSTS" ]]; then
+        printf '%s' "$ETC_HOSTS"
+        return
+    fi
+    if [[ -f "$SCRIPT_DIR/hosts.txt" ]]; then
+        printf '%s' "$SCRIPT_DIR/hosts.txt"
+        return
+    fi
+    printf '%s' "$ETC_HOSTS"
+}
+
+# Default list shipped with the program. install.sh copies it to /etc only
+# when that file does not exist yet.
+seed_hosts_file() {
+    if [[ -f "$SCRIPT_DIR/hosts.txt" ]]; then
+        printf '%s' "$SCRIPT_DIR/hosts.txt"
+        return
+    fi
+    if [[ -f "$SHARE_HOSTS" ]]; then
+        printf '%s' "$SHARE_HOSTS"
+        return
+    fi
+    return 1
+}
+
+require_root() {
+    [[ "$(id -u)" -eq 0 ]] || die "this command needs root (sudo host-route $1)"
+}
+
+# The packaged binary is the one on PATH. HOST_ROUTE_BIN overrides it.
+locate_sing_box() {
+    local candidate
+    if [[ -n "${HOST_ROUTE_BIN:-}" ]]; then
+        printf '%s' "$HOST_ROUTE_BIN"
+        return 0
+    fi
+    candidate=$(command -v sing-box 2>/dev/null || true)
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+        readlink -f "$candidate"
+        return 0
+    fi
+    if [[ -x /usr/bin/sing-box ]]; then
+        printf '%s' /usr/bin/sing-box
+        return 0
+    fi
+    return 1
+}
+
+require_sing_box() {
+    if [[ -z "$SING_BOX" ]]; then
+        SING_BOX=$(locate_sing_box) || die "sing-box is not on PATH. Install it from https://sing-box.sagernet.org/installation/package-manager/"
+    fi
+    [[ -x "$SING_BOX" ]] || die "sing-box is not executable at ${SING_BOX}"
+}
+
+# The unit file is what makes start/stop go through systemd. A checkout that
+# has not been installed keeps the previous in-process behavior.
+service_installed() {
+    [[ -f "$UNIT_PATH" ]] && command -v systemctl >/dev/null 2>&1
+}
+
+# Create the system host list from the seed the first time a root command
+# needs it. A missing /etc file is an incomplete install for anyone else.
+ensure_hosts_file() {
+    local destination seed
+    destination=$(hosts_file)
+    [[ -f "$destination" ]] && return 0
+    seed=$(seed_hosts_file) || die "no host list at ${destination}"
+    [[ "$(id -u)" -eq 0 ]] || die "no host list at ${destination}. From the project directory run: sudo ./install.sh"
+    install -d -m 0755 "$(dirname "$destination")"
+    install -m 0644 "$seed" "$destination"
+}
+
+# Resolve the tunnel from the address NetworkManager gave that profile.
+# The profile's device field is the physical NIC, so the address is what
+# identifies the tun. Returns non-zero when the profile is down so the
+# dispatcher can retry; callers that need a message use wait_for_vpn.
+probe_vpn() {
+    vpn_iface=""
+    vpn_gateway=""
+    local vpn_address
+    command -v nmcli >/dev/null 2>&1 || return 1
+    [[ -n "$VPN_CONNECTION" ]] || return 1
+    vpn_address=$(nmcli -g IP4.ADDRESS connection show "$VPN_CONNECTION" 2>/dev/null | grep -oEm1 '([0-9]{1,3}\.){3}[0-9]{1,3}' || true)
+    [[ -n "$vpn_address" ]] || return 1
+    vpn_iface=$(ip -4 -o addr show | awk -v ip="$vpn_address" '
+        {
+            split($4, parts, "/")
+            if (parts[1] == ip) {
+                print $2
+                exit
+            }
+        }
+    ')
+    [[ -n "$vpn_iface" && "$vpn_iface" != "$TUN_NAME" ]] || return 1
+    vpn_gateway=$(ip -4 route show dev "$vpn_iface" | awk '$2 == "via" { print $3; exit }')
+    return 0
+}
+
+# The address on hostroute must not already be covered by a VPN prefix, or
+# traffic to the local TUN would be sent back into the VPN.
+assert_tun_address_available() {
+    local tun_host route_line
+    tun_host=${TUN_ADDRESS%/*}
+    route_line=$(ip -4 route get "$tun_host" 2>/dev/null || true)
+    if [[ "$route_line" == *"dev ${vpn_iface}"* ]]; then
+        die "${TUN_ADDRESS} is already routed through ${vpn_iface}. Choose another TUN address."
+    fi
+}
+
+wait_for_vpn() {
+    local attempt
+    ensure_connection
+    if [[ -z "${CONNECTION_ID:-}" ]]; then
+        probe_vpn || die "${VPN_CONNECTION} has no IPv4 address. Connect it first."
+        return
+    fi
+    for attempt in $(seq 1 20); do
+        if probe_vpn; then
+            return
+        fi
+        sleep 0.25
+    done
+    die "${VPN_CONNECTION} did not come up with an IPv4 address"
+}
+
+prepare_state_dir() {
+    install -d -m 0755 "$STATE_DIR"
+}
+
+# Write sing-box JSON from hosts.txt. Prints a short count such as
+# "1 exact, 2 suffix" on stdout.
+write_config() {
+    local destination=$1
+    ensure_hosts_file
+    python3 - "$destination" "$(hosts_file)" "$vpn_iface" "$LOG_LEVEL" "$TUN_NAME" \
+        "$TUN_ADDRESS" "$SINGBOX_TABLE" "$SINGBOX_RULE_INDEX" "$TUNNEL_MARK" "$DIRECT_MARK" <<'PY'
+import json
+import re
+import sys
+
+destination, hosts_path, vpn_iface, log_level, tun_name, tun_address, table_index, rule_index, tunnel_mark, direct_mark = sys.argv[1:]
+allowed_levels = {"debug", "info", "warn", "error", "fatal", "panic"}
+if log_level not in allowed_levels:
+    sys.exit(f"host-route: unsupported log level {log_level}")
+
+label = r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)"
+hostname_pattern = re.compile(rf"{label}(?:\.{label})+")
+exact_names = []
+suffix_names = []
+
+with open(hosts_path, encoding="utf-8") as hosts_handle:
+    for line_number, raw_line in enumerate(hosts_handle, start=1):
+        hostname = raw_line.split("#", 1)[0].strip().lower().rstrip(".")
+        if not hostname:
+            continue
+        wildcard = False
+        if hostname.startswith("*."):
+            wildcard = True
+            hostname = hostname[2:]
+        if hostname_pattern.fullmatch(hostname) is None:
+            sys.exit(f"host-route: {hosts_path}:{line_number}: invalid hostname {raw_line.strip()!r}")
+        if wildcard:
+            suffix_names.append(hostname)
+        else:
+            exact_names.append(hostname)
+
+# Preserve order while dropping duplicates, so a repeated line does not
+# change the generated rule.
+def unique(names):
+    seen = set()
+    ordered = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+exact_names = unique(exact_names)
+suffix_names = unique(suffix_names)
+if not exact_names and not suffix_names:
+    sys.exit(f"host-route: {hosts_path} has no hostnames")
+
+rules = [{"action": "sniff", "timeout": "300ms"}]
+if exact_names:
+    rules.append({"domain": exact_names, "outbound": "tunnel"})
+if suffix_names:
+    rules.append({"domain_suffix": suffix_names, "outbound": "tunnel"})
+
+config = {
+    "log": {
+        "level": log_level,
+        "timestamp": True,
+    },
+    "inbounds": [
+        {
+            "type": "tun",
+            "tag": "tun-in",
+            "interface_name": tun_name,
+            "address": [tun_address],
+            "mtu": 1500,
+            # Capture traffic so the server name can be read. auto_redirect
+            # is left off because it refuses per-outbound routing marks, and
+            # those marks are how the two paths stay apart.
+            "auto_route": True,
+            "strict_route": False,
+            "auto_redirect": False,
+            "iproute2_table_index": int(table_index),
+            "iproute2_rule_index": int(rule_index),
+            # systemd-resolved stays the resolver. Hijacking port 53 would
+            # replace the host resolver and the VPN search domain for every
+            # name.
+            "dns_mode": "disabled",
+        }
+    ],
+    "outbounds": [
+        {
+            "type": "direct",
+            "tag": "tunnel",
+            "bind_interface": vpn_iface,
+            "routing_mark": int(tunnel_mark),
+        },
+        {
+            "type": "direct",
+            "tag": "direct",
+            "routing_mark": int(direct_mark),
+        },
+    ],
+    "route": {
+        # Sockets that are not an explicit outbound still take the normal path.
+        "default_mark": int(direct_mark),
+        "rules": rules,
+        "final": "direct",
+    },
+}
+
+with open(destination, "w", encoding="utf-8") as config_handle:
+    json.dump(config, config_handle, indent=2)
+    config_handle.write("\n")
+summary = []
+if exact_names:
+    summary.append(f"{len(exact_names)} exact")
+if suffix_names:
+    summary.append(f"{len(suffix_names)} suffix")
+print(", ".join(summary))
+PY
+    chmod 0644 "$destination"
+}
+
+rule_shows_mark() {
+    local shown=$1
+    local mark=$2
+    local mark_hex
+    printf -v mark_hex '0x%x' "$mark"
+    [[ "$shown" == *"fwmark ${mark_hex}"* || "$shown" == *"fwmark ${mark}/"* || "$shown" == *"fwmark ${mark} "* || "$shown" == *"fwmark ${mark}" ]]
+}
+
+# ip(8) can block in the kernel when a routing loop has wedged the stack.
+# Bound every call so stop can return and the operator can reboot if needed.
+run_ip() {
+    timeout 2 "$@"
+}
+
+# Delete one of our rules without touching a different rule at the same
+# priority. iproute2 prints the mark in hex.
+delete_mark_rule() {
+    local preference=$1
+    local mark=$2
+    local shown
+    while true; do
+        shown=$(run_ip ip rule show pref "$preference" 2>/dev/null || true)
+        if ! rule_shows_mark "$shown" "$mark"; then
+            break
+        fi
+        run_ip ip rule del pref "$preference" || break
+    done
+}
+
+install_policy() {
+    local shown
+    delete_mark_rule "$TUNNEL_RULE_PREF" "$TUNNEL_MARK"
+    delete_mark_rule "$DIRECT_RULE_PREF" "$DIRECT_MARK"
+    if [[ -n "$vpn_gateway" ]]; then
+        # onlink: the gateway is reached on the tun even though table 76 does
+        # not contain the tunnel subnet route.
+        if ! ip route replace default via "$vpn_gateway" dev "$vpn_iface" onlink table "$TUNNEL_TABLE"; then
+            ip route replace default via "$vpn_gateway" dev "$vpn_iface" table "$TUNNEL_TABLE" || return 1
+        fi
+    else
+        ip route replace default dev "$vpn_iface" table "$TUNNEL_TABLE" || return 1
+    fi
+    # Lower priority number wins, so these are consulted before sing-box's
+    # capture rules. Mark 77 must select a real table. A goto whose priority
+    # has no rule stays unresolved, and the socket falls into hostroute.
+    ip rule add pref "$TUNNEL_RULE_PREF" fwmark "$TUNNEL_MARK" lookup "$TUNNEL_TABLE" || return 1
+    ip rule add pref "$DIRECT_RULE_PREF" fwmark "$DIRECT_MARK" lookup main || return 1
+    # Ahead of the tun capture rules, so lookups never enter hostroute.
+    ip rule add pref "$DNS_UDP_PREF" ipproto udp dport 53 lookup main || return 1
+    ip rule add pref "$DNS_TCP_PREF" ipproto tcp dport 53 lookup main || return 1
+    ip rule add pref "$DOT_TCP_PREF" ipproto tcp dport 853 lookup main || return 1
+    ip rule add pref "$DOT_UDP_PREF" ipproto udp dport 853 lookup main || return 1
+    shown=$(ip rule show pref "$DIRECT_RULE_PREF" 2>/dev/null || true)
+    [[ "$shown" == *"lookup main"* && "$shown" != *unresolved* ]] || return 1
+    sysctl -w "net.ipv4.conf.${vpn_iface}.rp_filter=2" >/dev/null || return 1
+}
+
+clear_policy() {
+    local preference
+    delete_mark_rule "$TUNNEL_RULE_PREF" "$TUNNEL_MARK"
+    delete_mark_rule "$DIRECT_RULE_PREF" "$DIRECT_MARK"
+    for preference in "$DNS_UDP_PREF" "$DNS_TCP_PREF" "$DOT_TCP_PREF" "$DOT_UDP_PREF"; do
+        run_ip ip rule del pref "$preference" >/dev/null 2>&1 || true
+    done
+    run_ip ip route flush table "$TUNNEL_TABLE" >/dev/null 2>&1 || true
+}
+
+# sing-box removes these on a clean exit. A killed process can leave the
+# capture rules in place, and those rules would keep steering traffic at a
+# device that no longer exists.
+clear_stale_singbox_rules() {
+    local preference shown
+    if [[ -d "/sys/class/net/${TUN_NAME}" ]]; then
+        run_ip ip link del "$TUN_NAME" >/dev/null 2>&1 || true
+    fi
+    for preference in $(seq "$SINGBOX_RULE_INDEX" "$SINGBOX_RULE_END"); do
+        while true; do
+            shown=$(run_ip ip rule show pref "$preference" 2>/dev/null || true)
+            [[ -n "$shown" ]] || break
+            run_ip ip rule del pref "$preference" >/dev/null 2>&1 || break
+        done
+    done
+    run_ip ip route flush table "$SINGBOX_TABLE" >/dev/null 2>&1 || true
+}
+
+running_pid() {
+    local pid
+    [[ -f "$PID_FILE" ]] || return 1
+    pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    [[ -d "/proc/${pid}" ]] || return 1
+    # The recorded pid must still be this sing-box, not a recycled pid.
+    tr '\0' ' ' < "/proc/${pid}/cmdline" | grep -q 'sing-box' || return 1
+    printf '%s' "$pid"
+}
+
+stop_process() {
+    local pid attempt
+    pid=$(running_pid || true)
+    if [[ -z "$pid" ]]; then
+        rm -f "$PID_FILE"
+        return
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
+    for attempt in $(seq 1 10); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$PID_FILE"
+            return
+        fi
+        sleep 0.1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+    rm -f "$PID_FILE"
+}
+
+# Remove the capture path before waiting on the process. A routing loop can
+# leave sing-box uninterruptible, and stop still has to give the kernel its
+# normal rules back.
+force_down() {
+    tun_firewall_revoke
+    clear_stale_singbox_rules
+    stop_process
+    clear_policy
+}
+
+show_log_tail() {
+    if [[ -f "$LOG_FILE" ]]; then
+        echo "host-route: last log lines:" >&2
+        tail -n 40 "$LOG_FILE" >&2 || true
+    fi
+}
+
+fail_start() {
+    echo "host-route: $*" >&2
+    show_log_tail
+    force_down
+    exit 1
+}
+
+# firewalld puts an interface it does not know into the default zone, and
+# that zone rejects input with "admin prohibited". sing-box writes the TCP
+# handshake back onto hostroute, addressed to this host, so the zone has to
+# accept it. The zone change is runtime-only and is removed on stop.
+tun_firewall_allow() {
+    if ! command -v firewall-cmd >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! firewall-cmd --state >/dev/null 2>&1; then
+        return 0
+    fi
+    firewall-cmd --zone=trusted --change-interface="$TUN_NAME" >/dev/null
+}
+
+tun_firewall_revoke() {
+    if ! command -v firewall-cmd >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! firewall-cmd --state >/dev/null 2>&1; then
+        return 0
+    fi
+    firewall-cmd --zone=trusted --remove-interface="$TUN_NAME" >/dev/null 2>&1 || true
+}
+
+# The default path has to survive start. An unresolved rule once sent every
+# lookup back into the tunnel and DNS died. Roll back if that happens.
+verify_default_path() {
+    local answer curl_status
+    answer=$(timeout 3 dig +time=1 +tries=1 example.com A +short 2>&1 || true)
+    printf 'host-route: dns check: %s\n' "${answer:-<empty>}" >&2
+    if [[ -z "$answer" || "$answer" == *'timed out'* || "$answer" == *'error'* ]]; then
+        return 1
+    fi
+    curl_status=$(timeout 8 curl -4 -sS -o /dev/null -w '%{http_code}' --max-time 6 https://example.com 2>&1 || true)
+    printf 'host-route: https check: %s\n' "${curl_status:-<empty>}" >&2
+    [[ "$curl_status" == "200" ]]
+}
+
+# SUPERVISED is set when this shell stays alive and waits. The child must stay
+# a child of this shell: a nested background subshell would exit and reparent
+# sing-box, and wait would not be able to see it. exec keeps the same pid.
+# The lock is fd 9 in this shell and must not be inherited, or a later stop
+# waits on it. Unsupervised start uses setsid so the process survives after
+# this command returns.
+start_sing_box() {
+    : >"$LOG_FILE"
+    chmod 0644 "$LOG_FILE"
+    if [[ -n "${SUPERVISED:-}" ]]; then
+        (
+            exec 9>&-
+            exec "$SING_BOX" run -c "$CONFIG_FILE" >>"$LOG_FILE" 2>&1 < /dev/null
+        ) &
+    else
+        (
+            exec 9>&-
+            exec setsid "$SING_BOX" run -c "$CONFIG_FILE" >>"$LOG_FILE" 2>&1 < /dev/null
+        ) &
+    fi
+    echo $! >"$PID_FILE"
+}
+
+wait_until_ready() {
+    local pid attempt
+    pid=$(cat "$PID_FILE")
+    for attempt in $(seq 1 50); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            fail_start "sing-box exited while starting"
+        fi
+        if [[ -d "/sys/class/net/${TUN_NAME}" ]] && ip rule show pref "$SINGBOX_RULE_END" | grep -q .; then
+            tun_firewall_allow || fail_start "could not trust ${TUN_NAME} in firewalld"
+            return
+        fi
+        sleep 0.1
+    done
+    fail_start "sing-box did not install its policy rules at ${SINGBOX_RULE_INDEX}-${SINGBOX_RULE_END}"
+}
+
+with_lock() {
+    prepare_state_dir
+    exec 9>"$LOCK_FILE"
+    flock -w 10 9 || die "another host-route command is still running"
+}
+
+cmd_check() {
+    local counts temp_config
+    require_sing_box
+    ensure_connection
+    ensure_hosts_file
+    if ! probe_vpn; then
+        vpn_iface="tun0"
+        vpn_gateway=""
+    fi
+    temp_config=$(mktemp)
+    counts=$(write_config "$temp_config")
+    "$SING_BOX" check -c "$temp_config"
+    rm -f "$temp_config"
+    echo "config ok (${counts}) using interface ${vpn_iface}"
+}
+
+start_locked() {
+    local counts
+    if running_pid >/dev/null; then
+        echo "host-route is already running ($(running_pid))"
+        return
+    fi
+    wait_for_vpn
+    assert_tun_address_available
+    counts=$(write_config "$CONFIG_FILE")
+    "$SING_BOX" check -c "$CONFIG_FILE"
+    install_policy || fail_start "could not install policy routes"
+    start_sing_box || fail_start "could not start sing-box"
+    wait_until_ready
+    if [[ -z "${HOST_ROUTE_SKIP_CHECK:-}" ]]; then
+        verify_default_path || fail_start "default DNS or HTTPS failed after start; removed the route"
+    fi
+    {
+        echo "routing ${counts} hostnames through ${vpn_iface} (${vpn_gateway:-on-link})"
+        echo "other destinations follow: $(ip -4 route show default | head -n 1)"
+    } >"$SUMMARY_FILE"
+    cat "$SUMMARY_FILE"
+}
+
+cmd_start() {
+    require_root start
+    require_sing_box
+    ensure_connection
+    if service_installed; then
+        systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+        if systemctl is-active --quiet "$SERVICE_NAME"; then
+            echo "host-route is already running"
+            [[ -f "$SUMMARY_FILE" ]] && cat "$SUMMARY_FILE"
+            return
+        fi
+        if ! systemctl start "$SERVICE_NAME"; then
+            echo "host-route: service failed to start" >&2
+            journalctl -u "$SERVICE_NAME" -n 40 --no-pager >&2 || true
+            exit 1
+        fi
+        [[ -f "$SUMMARY_FILE" ]] && cat "$SUMMARY_FILE"
+        return
+    fi
+    with_lock
+    start_locked
+}
+
+cmd_stop() {
+    require_root stop
+    prepare_state_dir
+    # Ask systemd first when it owns the process. The service trap tears the
+    # route down. force_down below covers a crashed service and a start that
+    # never went through systemd. Do not take the lock first: the service
+    # holds it, and waiting on it is what used to hang stop.
+    if service_installed && systemctl is-active --quiet "$SERVICE_NAME"; then
+        systemctl stop "$SERVICE_NAME" || true
+    fi
+    force_down
+    echo "stopped"
+}
+
+cmd_reload() {
+    require_root reload
+    require_sing_box
+    ensure_connection
+    if service_installed; then
+        systemctl restart "$SERVICE_NAME"
+        [[ -f "$SUMMARY_FILE" ]] && cat "$SUMMARY_FILE"
+        return
+    fi
+    with_lock
+    if running_pid >/dev/null; then
+        force_down
+    fi
+    start_locked
+}
+
+# Foreground entry used by host-route.service. The shell stays as the main
+# process so a stop signal can remove the policy rules, then waits on sing-box.
+cmd_run() {
+    local pid
+    require_root run
+    require_sing_box
+    with_lock
+    if running_pid >/dev/null; then
+        die "already running ($(running_pid)); stop it before run"
+    fi
+    SUPERVISED=1
+    # TERM must clean up explicitly. An untrapped TERM kills the shell
+    # without running the EXIT trap, and the capture rules would stay behind.
+    trap 'force_down' EXIT
+    trap 'trap - EXIT INT TERM; force_down; exit 0' INT TERM
+    start_locked
+    if [[ -n "${NOTIFY_SOCKET:-}" ]]; then
+        systemd-notify --ready
+    fi
+    pid=$(running_pid || true)
+    [[ -n "$pid" ]] || exit 0
+    wait "$pid" || true
+}
+
+cmd_status() {
+    local pid destination connection_name
+    destination=$(hosts_file)
+    connection_name=$(read_connection || true)
+    VPN_CONNECTION=$connection_name
+    if service_installed; then
+        echo "service $(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
+    fi
+    pid=$(running_pid || true)
+    if [[ -n "$pid" ]]; then
+        echo "running pid ${pid}"
+    else
+        echo "stopped"
+    fi
+    if [[ -z "$connection_name" ]]; then
+        echo "connection is not set (${ETC_CONFIG})"
+    elif probe_vpn; then
+        echo "vpn ${VPN_CONNECTION} on ${vpn_iface} gateway ${vpn_gateway:-on-link}"
+    else
+        echo "vpn ${VPN_CONNECTION} is down"
+    fi
+    echo "default $(ip -4 route show default | head -n 1 || true)"
+    if [[ -f "$destination" ]]; then
+        echo "hosts ${destination}"
+        awk '
+            /^[[:space:]]*($|#)/ { next }
+            { print "  " $0 }
+        ' "$destination"
+    else
+        echo "hosts ${destination} (not created yet)"
+    fi
+    ip rule show pref "$TUNNEL_RULE_PREF" 2>/dev/null || true
+    ip rule show pref "$DIRECT_RULE_PREF" 2>/dev/null || true
+    if [[ -f "$LOG_FILE" ]]; then
+        echo "log ${LOG_FILE}"
+    fi
+}
+
+cmd_install_dispatcher() {
+    local dispatcher_body
+    require_root install-dispatcher
+    dispatcher_body=$(cat <<EOF
+#!/bin/bash
+# Bring hostname steering up and down with the configured VPN.
+# Installed by host-route. NetworkManager runs this as root.
+set -euo pipefail
+config="${ETC_CONFIG}"
+connection=\$(awk -F= '
+    /^[[:space:]]*#/ { next }
+    \$1 ~ /^[[:space:]]*connection[[:space:]]*\$/ {
+        sub(/^[^=]*=/, "")
+        gsub(/^[[:space:]]+|[[:space:]]+\$/, "")
+        if (\$0 != "") {
+            print
+            exit
+        }
+    }
+' "\$config" 2>/dev/null || true)
+[[ -n "\$connection" ]] || exit 0
+if [[ "\${CONNECTION_ID:-}" != "\$connection" ]]; then
+    exit 0
+fi
+case "\${2:-}" in
+    vpn-up|up)
+        "${SCRIPT_PATH}" start
+        ;;
+    vpn-down|down)
+        "${SCRIPT_PATH}" stop
+        ;;
+esac
+EOF
+)
+    printf '%s\n' "$dispatcher_body" >"$DISPATCHER_PATH"
+    chmod 0755 "$DISPATCHER_PATH"
+    echo "installed ${DISPATCHER_PATH}"
+}
+
+cmd_uninstall_dispatcher() {
+    require_root uninstall-dispatcher
+    rm -f "$DISPATCHER_PATH"
+    echo "removed ${DISPATCHER_PATH}"
+}
+
+main() {
+    local command=${1:-}
+    case "$command" in
+        start) cmd_start ;;
+        stop) cmd_stop ;;
+        reload|restart) cmd_reload ;;
+        status) cmd_status ;;
+        check) cmd_check ;;
+        run) cmd_run ;;
+        install-dispatcher) cmd_install_dispatcher ;;
+        uninstall-dispatcher) cmd_uninstall_dispatcher ;;
+        -h|--help|help|"") usage ;;
+        *)
+            usage >&2
+            die "unknown command ${command}"
+            ;;
+    esac
+}
+
+main "$@"
